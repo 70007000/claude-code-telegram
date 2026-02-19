@@ -109,30 +109,21 @@ class ToolMonitor:
                     logger.warning("Invalid file path in tool call", **violation)
                     return False, error
 
-        # Validate shell commands
+        # Validate shell commands — only block truly destructive patterns.
+        # Claude Code has its own permission system; pipes, redirects, curl etc. are normal.
         if tool_name in ["bash", "shell", "Bash"]:
             command = tool_input.get("command", "")
 
-            # Check for dangerous commands
             dangerous_patterns = [
-                "rm -rf",
-                "sudo",
-                "chmod 777",
-                "curl",
-                "wget",
-                "nc ",
-                "netcat",
-                ">",
-                ">>",
-                "|",
-                "&",
-                ";",
-                "$(",
-                "`",
+                "rm -rf /",
+                "rm -rf ~",
+                "mkfs.",
+                "dd if=",
+                ":(){:|:&};:",
             ]
 
             for pattern in dangerous_patterns:
-                if pattern in command.lower():
+                if pattern in command:
                     violation = {
                         "type": "dangerous_command",
                         "tool_name": tool_name,

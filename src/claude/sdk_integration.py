@@ -176,7 +176,9 @@ class ClaudeSDKManager:
                 max_turns=self.config.claude_max_turns,
                 cwd=str(working_directory),
                 allowed_tools=self.config.claude_allowed_tools,
+                permission_mode="bypassPermissions",
                 cli_path=cli_path,
+                max_buffer_size=10 * 1024 * 1024,  # 10MB (default 1MB too small for MCP)
             )
 
             # Pass MCP server configuration if enabled
@@ -388,8 +390,8 @@ class ClaudeSDKManager:
                         if isinstance(block, ToolUseBlock):
                             tool_calls.append(
                                 {
-                                    "name": getattr(block, "tool_name", "unknown"),
-                                    "input": getattr(block, "tool_input", {}),
+                                    "name": getattr(block, "name", "unknown"),
+                                    "input": getattr(block, "input", {}),
                                     "id": getattr(block, "id", None),
                                 }
                             )
@@ -456,9 +458,9 @@ class ClaudeSDKManager:
                         if isinstance(block, ToolUseBlock):
                             tools_used.append(
                                 {
-                                    "name": getattr(block, "tool_name", "unknown"),
+                                    "name": getattr(block, "name", "unknown"),
                                     "timestamp": current_time,
-                                    "input": getattr(block, "tool_input", {}),
+                                    "input": getattr(block, "input", {}),
                                 }
                             )
 

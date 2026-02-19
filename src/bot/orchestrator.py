@@ -24,6 +24,7 @@ from telegram.ext import (
 from ..claude.exceptions import ClaudeToolValidationError
 from ..claude.integration import StreamUpdate
 from ..config.settings import Settings
+from .message_queue import message_queue
 from .utils.html_format import escape_html
 
 logger = structlog.get_logger()
@@ -70,29 +71,32 @@ def _redact_secrets(text: str) -> str:
     return result
 
 
-# Tool name -> friendly emoji mapping for verbose output
-_TOOL_ICONS: Dict[str, str] = {
-    "Read": "\U0001f4d6",
-    "Write": "\u270f\ufe0f",
-    "Edit": "\u270f\ufe0f",
-    "MultiEdit": "\u270f\ufe0f",
-    "Bash": "\U0001f4bb",
-    "Glob": "\U0001f50d",
-    "Grep": "\U0001f50d",
-    "LS": "\U0001f4c2",
-    "Task": "\U0001f9e0",
-    "WebFetch": "\U0001f310",
-    "WebSearch": "\U0001f310",
-    "NotebookRead": "\U0001f4d3",
-    "NotebookEdit": "\U0001f4d3",
-    "TodoRead": "\u2611\ufe0f",
-    "TodoWrite": "\u2611\ufe0f",
+# Human-readable tool descriptions for progress display
+_TOOL_DISPLAY: Dict[str, str] = {
+    "Read": "Reading",
+    "Write": "Writing",
+    "Edit": "Editing",
+    "MultiEdit": "Editing",
+    "Bash": "Running",
+    "Glob": "Searching",
+    "Grep": "Searching",
+    "LS": "Listing",
+    "Task": "Delegating",
+    "WebFetch": "Fetching",
+    "WebSearch": "Searching web",
+    "NotebookRead": "Reading notebook",
+    "NotebookEdit": "Editing notebook",
+    "TodoRead": "Reading todos",
+    "TodoWrite": "Writing todos",
 }
 
 
-def _tool_icon(name: str) -> str:
-    """Return emoji for a tool, with a default wrench."""
-    return _TOOL_ICONS.get(name, "\U0001f527")
+def _tool_display(name: str, detail: str = "") -> str:
+    """Return a clean progress line for a tool call."""
+    verb = _TOOL_DISPLAY.get(name, name)
+    if detail:
+        return f"{verb} {detail}"
+    return verb
 
 
 class MessageOrchestrator:
@@ -121,21 +125,23 @@ class MessageOrchestrator:
             self._register_classic_handlers(app)
 
     def _register_agentic_handlers(self, app: Application) -> None:
-        """Register minimal agentic handlers: 4 commands + text/file/photo."""
+        """Register minimal agentic handlers: commands + text/file/photo."""
         # Commands
         for cmd, handler in [
             ("start", self.agentic_start),
             ("new", self.agentic_new),
+            ("stop", self.agentic_stop),
+            ("cancel", self.agentic_stop),  # /cancel alias for /stop
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
         ]:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
 
-        # Text messages -> Claude
+        # Text messages -> Claude (via queue)
         app.add_handler(
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND,
-                self._inject_deps(self.agentic_text),
+                self._inject_deps(self.agentic_text_entry),
             ),
             group=10,
         )
@@ -162,7 +168,7 @@ class MessageOrchestrator:
             )
         )
 
-        logger.info("Agentic handlers registered (3 commands + text/file/photo)")
+        logger.info("Agentic handlers registered (commands + text/file/photo)")
 
     def _register_classic_handlers(self, app: Application) -> None:
         """Register full classic handler set (moved from core.py)."""
@@ -216,6 +222,8 @@ class MessageOrchestrator:
             return [
                 BotCommand("start", "Start the bot"),
                 BotCommand("new", "Start a fresh session"),
+                BotCommand("stop", "Stop current task"),
+                BotCommand("cancel", "Cancel current task and clear queue"),
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
             ]
@@ -243,7 +251,7 @@ class MessageOrchestrator:
     ) -> None:
         """Brief welcome, no buttons."""
         user = update.effective_user
-        current_dir = context.user_data.get(
+        current_dir = context.chat_data.get(
             "current_directory", self.settings.approved_directory
         )
         dir_display = f"<code>{current_dir}/</code>"
@@ -253,7 +261,7 @@ class MessageOrchestrator:
             f"Hi {safe_name}! I'm your AI coding assistant.\n"
             f"Just tell me what you need — I can read, write, and run code.\n\n"
             f"Working in: {dir_display}\n"
-            f"Commands: /new (reset) · /status",
+            f"Commands: /new (reset) · /stop · /status",
             parse_mode="HTML",
         )
 
@@ -261,21 +269,67 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Reset session, one-line confirmation."""
-        context.user_data["claude_session_id"] = None
-        context.user_data["session_started"] = True
+        context.chat_data["claude_session_id"] = None
+        context.chat_data["session_started"] = True
+        context.chat_data["force_new_session"] = True
 
         await update.message.reply_text("Session reset. What's next?")
+
+    async def agentic_stop(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Cancel the running Claude task, clear queue, kill subprocess."""
+        import os
+        import signal
+
+        chat_id = update.effective_chat.id
+
+        # Clear queued messages
+        cleared = message_queue.cancel_all(chat_id)
+
+        running_task: Optional[asyncio.Task] = context.chat_data.get("running_task")
+        if not running_task or running_task.done():
+            if cleared:
+                await update.message.reply_text(f"Cleared {cleared} queued message(s).")
+            else:
+                await update.message.reply_text("Nothing running.")
+            return
+
+        # Kill child claude processes of our bot PID
+        bot_pid = os.getpid()
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["pgrep", "-P", str(bot_pid)],
+                capture_output=True,
+                text=True,
+            )
+            for child_pid in result.stdout.strip().split("\n"):
+                if child_pid:
+                    try:
+                        os.kill(int(child_pid), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+        except Exception:
+            pass
+
+        # Cancel the asyncio task
+        running_task.cancel()
+
+        suffix = f" Cleared {cleared} queued." if cleared else ""
+        await update.message.reply_text(f"Cancelled.{suffix}")
 
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Compact one-line status, no buttons."""
-        current_dir = context.user_data.get(
+        current_dir = context.chat_data.get(
             "current_directory", self.settings.approved_directory
         )
         dir_display = str(current_dir)
 
-        session_id = context.user_data.get("claude_session_id")
+        session_id = context.chat_data.get("claude_session_id")
         session_status = "active" if session_id else "none"
 
         # Cost info
@@ -290,13 +344,18 @@ class MessageOrchestrator:
             except Exception:
                 pass
 
+        # Queue info
+        chat_id = update.effective_chat.id
+        queue_size = message_queue.queue_size(chat_id)
+        queue_str = f" · Queue: {queue_size}" if queue_size else ""
+
         await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
+            f"Session: {session_status}{cost_str}{queue_str}\n{dir_display}"
         )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
-        user_override = context.user_data.get("verbose_level")
+        user_override = context.chat_data.get("verbose_level")
         if user_override is not None:
             return int(user_override)
         return self.settings.verbose_level
@@ -312,9 +371,9 @@ class MessageOrchestrator:
             await update.message.reply_text(
                 f"Verbosity: <b>{current}</b> ({labels.get(current, '?')})\n\n"
                 "Usage: <code>/verbose 0|1|2</code>\n"
-                "  0 = quiet (final response only)\n"
-                "  1 = normal (tools + reasoning)\n"
-                "  2 = detailed (tools with inputs + reasoning)",
+                "  0 = quiet (elapsed time only)\n"
+                "  1 = normal (tool names)\n"
+                "  2 = detailed (tools with inputs)",
                 parse_mode="HTML",
             )
             return
@@ -329,7 +388,7 @@ class MessageOrchestrator:
             )
             return
 
-        context.user_data["verbose_level"] = level
+        context.chat_data["verbose_level"] = level
         labels = {0: "quiet", 1: "normal", 2: "detailed"}
         await update.message.reply_text(
             f"Verbosity set to <b>{level}</b> ({labels[level]})",
@@ -338,68 +397,74 @@ class MessageOrchestrator:
 
     def _format_verbose_progress(
         self,
-        activity_log: List[Dict[str, Any]],
+        tool_log: List[Dict[str, Any]],
         verbose_level: int,
         start_time: float,
     ) -> str:
-        """Build the progress message text based on activity so far."""
-        if not activity_log:
-            return "Working..."
-
+        """Build clean progress message: elapsed time + recent tool operations."""
         elapsed = time.time() - start_time
-        lines: List[str] = [f"Working... ({elapsed:.0f}s)\n"]
 
-        for entry in activity_log[-15:]:  # Show last 15 entries max
-            kind = entry.get("kind", "tool")
-            if kind == "text":
-                # Claude's intermediate reasoning/commentary
-                snippet = entry.get("detail", "")
-                if verbose_level >= 2:
-                    lines.append(f"\U0001f4ac {snippet}")
-                else:
-                    # Level 1: one short line
-                    lines.append(f"\U0001f4ac {snippet[:80]}")
+        if verbose_level == 0:
+            return f"Working ({elapsed:.0f}s)"
+
+        # Filter to tool entries only (no assistant text in progress)
+        tool_entries = [e for e in tool_log if e.get("kind") == "tool"]
+
+        if not tool_entries:
+            return f"Working ({elapsed:.0f}s)"
+
+        lines: List[str] = [f"Working ({elapsed:.0f}s)\n"]
+
+        # Show last 5 tool operations
+        recent = tool_entries[-5:]
+        for i, entry in enumerate(recent):
+            name = entry.get("name", "?")
+            detail = entry.get("detail", "")
+            is_last = i == len(recent) - 1
+
+            if verbose_level >= 2 and detail:
+                line = _tool_display(name, detail)
             else:
-                # Tool call
-                icon = _tool_icon(entry["name"])
-                if verbose_level >= 2 and entry.get("detail"):
-                    lines.append(f"{icon} {entry['name']}: {entry['detail']}")
-                else:
-                    lines.append(f"{icon} {entry['name']}")
+                line = _tool_display(name, detail)
 
-        if len(activity_log) > 15:
-            lines.insert(1, f"... ({len(activity_log) - 15} earlier entries)\n")
+            # Current (last) operation gets "..." suffix
+            if is_last:
+                line += "..."
+
+            lines.append(line)
+
+        if len(tool_entries) > 5:
+            lines.insert(1, f"({len(tool_entries) - 5} earlier)")
 
         return "\n".join(lines)
 
     @staticmethod
     def _summarize_tool_input(tool_name: str, tool_input: Dict[str, Any]) -> str:
-        """Return a short summary of tool input for verbose level 2."""
+        """Return a short human-readable summary of tool input."""
         if not tool_input:
             return ""
         if tool_name in ("Read", "Write", "Edit", "MultiEdit"):
             path = tool_input.get("file_path") or tool_input.get("path", "")
             if path:
-                # Show just the filename, not the full path
                 return path.rsplit("/", 1)[-1]
         if tool_name in ("Glob", "Grep"):
             pattern = tool_input.get("pattern", "")
             if pattern:
-                return pattern[:60]
+                return f"'{pattern[:50]}'"
         if tool_name == "Bash":
             cmd = tool_input.get("command", "")
             if cmd:
-                return _redact_secrets(cmd[:100])[:80]
+                return _redact_secrets(cmd[:80])[:60]
         if tool_name in ("WebFetch", "WebSearch"):
-            return (tool_input.get("url", "") or tool_input.get("query", ""))[:60]
+            return (tool_input.get("url", "") or tool_input.get("query", ""))[:50]
         if tool_name == "Task":
             desc = tool_input.get("description", "")
             if desc:
-                return desc[:60]
+                return desc[:50]
         # Generic: show first key's value
         for v in tool_input.values():
             if isinstance(v, str) and v:
-                return v[:60]
+                return v[:50]
         return ""
 
     @staticmethod
@@ -407,12 +472,7 @@ class MessageOrchestrator:
         chat: Any,
         interval: float = 2.0,
     ) -> "asyncio.Task[None]":
-        """Start a background typing indicator task.
-
-        Sends typing every *interval* seconds, independently of
-        stream events. Cancel the returned task in a ``finally``
-        block.
-        """
+        """Start a background typing indicator task."""
 
         async def _heartbeat() -> None:
             try:
@@ -434,36 +494,26 @@ class MessageOrchestrator:
         tool_log: List[Dict[str, Any]],
         start_time: float,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
-        """Create a stream callback for verbose progress updates.
+        """Create a stream callback that updates progress with tool operations.
 
-        Returns None when verbose_level is 0 (nothing to display).
-        Typing indicators are handled by a separate heartbeat task.
+        Returns a callback for all verbose levels (including 0 for elapsed-only
+        updates). Typing indicators are handled by a separate heartbeat task.
         """
-        if verbose_level == 0:
-            return None
-
         last_edit_time = [0.0]  # mutable container for closure
+        # Throttle: 4s for verbose modes, 10s for quiet mode
+        throttle_interval = 10.0 if verbose_level == 0 else 4.0
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
-            # Capture tool calls
+            # Capture tool calls (always, even in quiet mode — needed for final count)
             if update_obj.tool_calls:
                 for tc in update_obj.tool_calls:
                     name = tc.get("name", "unknown")
                     detail = self._summarize_tool_input(name, tc.get("input", {}))
                     tool_log.append({"kind": "tool", "name": name, "detail": detail})
 
-            # Capture assistant text (reasoning / commentary)
-            if update_obj.type == "assistant" and update_obj.content:
-                text = update_obj.content.strip()
-                if text and verbose_level >= 1:
-                    # Collapse to first meaningful line, cap length
-                    first_line = text.split("\n", 1)[0].strip()
-                    if first_line:
-                        tool_log.append({"kind": "text", "detail": first_line[:120]})
-
-            # Throttle progress message edits to avoid Telegram rate limits
+            # Throttle progress message edits
             now = time.time()
-            if (now - last_edit_time[0]) >= 2.0 and tool_log:
+            if (now - last_edit_time[0]) >= throttle_interval:
                 last_edit_time[0] = now
                 new_text = self._format_verbose_progress(
                     tool_log, verbose_level, start_time
@@ -475,16 +525,31 @@ class MessageOrchestrator:
 
         return _on_stream
 
-    async def agentic_text(
+    async def agentic_text_entry(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Direct Claude passthrough. Simple progress. No suggestions."""
+        """Entry point for text messages — routes through per-chat queue."""
+        chat_id = update.effective_chat.id
+
+        await message_queue.enqueue_or_run(
+            chat_id=chat_id,
+            handler=self._agentic_text_impl,
+            args=(update, context),
+            reply_func=update.message.reply_text,
+        )
+
+    async def _agentic_text_impl(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Process a text message with Claude. Called by queue."""
         user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
         message_text = update.message.text
 
         logger.info(
             "Agentic text message",
             user_id=user_id,
+            chat_id=chat_id,
             message_length=len(message_text),
         )
 
@@ -493,7 +558,7 @@ class MessageOrchestrator:
         if rate_limiter:
             allowed, limit_message = await rate_limiter.check_rate_limit(user_id, 0.001)
             if not allowed:
-                await update.message.reply_text(f"⏱️ {limit_message}")
+                await update.message.reply_text(f"Rate limited: {limit_message}")
                 return
 
         chat = update.message.chat
@@ -509,32 +574,50 @@ class MessageOrchestrator:
             )
             return
 
-        current_dir = context.user_data.get(
+        current_dir = context.chat_data.get(
             "current_directory", self.settings.approved_directory
         )
-        session_id = context.user_data.get("claude_session_id")
+        session_id = context.chat_data.get("claude_session_id")
 
-        # --- Verbose progress tracking via stream callback ---
+        # Check if /new was used — skip auto-resume for this first message
+        force_new = bool(context.chat_data.get("force_new_session"))
+
+        # --- Progress tracking via stream callback ---
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
         on_stream = self._make_stream_callback(
             verbose_level, progress_msg, tool_log, start_time
         )
 
-        # Independent typing heartbeat — stays alive even with no stream events
+        # Independent typing heartbeat
         heartbeat = self._start_typing_heartbeat(chat)
 
-        success = True
-        try:
-            claude_response = await claude_integration.run_command(
+        # Wrap in a task so /stop can cancel it
+        chat_id = update.effective_chat.id
+
+        async def _run_claude():
+            return await claude_integration.run_command(
                 prompt=message_text,
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=session_id,
                 on_stream=on_stream,
+                force_new=force_new,
+                chat_id=chat_id,
             )
 
-            context.user_data["claude_session_id"] = claude_response.session_id
+        task = asyncio.create_task(_run_claude())
+        context.chat_data["running_task"] = task
+
+        success = True
+        try:
+            claude_response = await task
+
+            # Clear force_new flag after successful run
+            if force_new:
+                context.chat_data["force_new_session"] = False
+
+            context.chat_data["claude_session_id"] = claude_response.session_id
 
             # Track directory changes
             from .handlers.message import _update_working_directory_from_claude_response
@@ -557,13 +640,19 @@ class MessageOrchestrator:
                 except Exception as e:
                     logger.warning("Failed to log interaction", error=str(e))
 
-            # Format response (no reply_markup — strip keyboards)
+            # Format response
             from .utils.formatting import ResponseFormatter
 
             formatter = ResponseFormatter(self.settings)
             formatted_messages = formatter.format_claude_response(
                 claude_response.content
             )
+
+        except asyncio.CancelledError:
+            success = False
+            from .utils.formatting import FormattedMessage
+
+            formatted_messages = [FormattedMessage("Cancelled.")]
 
         except ClaudeToolValidationError as e:
             success = False
@@ -582,16 +671,63 @@ class MessageOrchestrator:
                 FormattedMessage(_format_error_message(str(e)), parse_mode="HTML")
             ]
         finally:
+            context.chat_data.pop("running_task", None)
             heartbeat.cancel()
 
-        await progress_msg.delete()
+        # --- Send response ---
+        # If single message that fits, edit the progress message (no bubble jump)
+        # If multiple messages needed, delete progress and send new ones
+        await self._send_response(update, progress_msg, formatted_messages)
+
+        # Audit log
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="text_message",
+                args=[message_text[:100]],
+                success=success,
+            )
+
+    async def _send_response(
+        self,
+        update: Update,
+        progress_msg: Any,
+        formatted_messages: List[Any],
+    ) -> None:
+        """Send formatted response, editing progress msg when possible."""
+        if not formatted_messages:
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+            return
+
+        # Single message that fits -> edit progress message in-place (no bubble jump)
+        if len(formatted_messages) == 1 and len(formatted_messages[0].text) <= 4000:
+            msg = formatted_messages[0]
+            try:
+                await progress_msg.edit_text(
+                    msg.text,
+                    parse_mode=msg.parse_mode,
+                )
+                return
+            except Exception:
+                # Fallback: if edit fails (e.g. parse error), delete and send new
+                pass
+
+        # Multiple messages or edit failed -> delete progress, send new messages
+        try:
+            await progress_msg.delete()
+        except Exception:
+            pass
 
         for i, message in enumerate(formatted_messages):
             try:
                 await update.message.reply_text(
                     message.text,
                     parse_mode=message.parse_mode,
-                    reply_markup=None,  # No keyboards in agentic mode
+                    reply_markup=None,
                     reply_to_message_id=(update.message.message_id if i == 0 else None),
                 )
                 if i < len(formatted_messages) - 1:
@@ -617,16 +753,6 @@ class MessageOrchestrator:
                             update.message.message_id if i == 0 else None
                         ),
                     )
-
-        # Audit log
-        audit_logger = context.bot_data.get("audit_logger")
-        if audit_logger:
-            await audit_logger.log_command(
-                user_id=user_id,
-                command="text_message",
-                args=[message_text[:100]],
-                success=success,
-            )
 
     async def agentic_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -703,10 +829,11 @@ class MessageOrchestrator:
             )
             return
 
-        current_dir = context.user_data.get(
+        current_dir = context.chat_data.get(
             "current_directory", self.settings.approved_directory
         )
-        session_id = context.user_data.get("claude_session_id")
+        session_id = context.chat_data.get("claude_session_id")
+        force_new = bool(context.chat_data.get("force_new_session"))
 
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
@@ -716,14 +843,21 @@ class MessageOrchestrator:
 
         heartbeat = self._start_typing_heartbeat(chat)
         try:
+            chat_id = update.effective_chat.id
             claude_response = await claude_integration.run_command(
                 prompt=prompt,
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=session_id,
                 on_stream=on_stream,
+                force_new=force_new,
+                chat_id=chat_id,
             )
-            context.user_data["claude_session_id"] = claude_response.session_id
+
+            if force_new:
+                context.chat_data["force_new_session"] = False
+
+            context.chat_data["claude_session_id"] = claude_response.session_id
 
             from .handlers.message import _update_working_directory_from_claude_response
 
@@ -738,17 +872,7 @@ class MessageOrchestrator:
                 claude_response.content
             )
 
-            await progress_msg.delete()
-
-            for i, message in enumerate(formatted_messages):
-                await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=None,
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
-                )
-                if i < len(formatted_messages) - 1:
-                    await asyncio.sleep(0.5)
+            await self._send_response(update, progress_msg, formatted_messages)
 
         except Exception as e:
             from .handlers.message import _format_error_message
@@ -790,10 +914,11 @@ class MessageOrchestrator:
                 )
                 return
 
-            current_dir = context.user_data.get(
+            current_dir = context.chat_data.get(
                 "current_directory", self.settings.approved_directory
             )
-            session_id = context.user_data.get("claude_session_id")
+            session_id = context.chat_data.get("claude_session_id")
+            force_new = bool(context.chat_data.get("force_new_session"))
 
             verbose_level = self._get_verbose_level(context)
             tool_log: List[Dict[str, Any]] = []
@@ -801,6 +926,7 @@ class MessageOrchestrator:
                 verbose_level, progress_msg, tool_log, time.time()
             )
 
+            chat_id = update.effective_chat.id
             heartbeat = self._start_typing_heartbeat(chat)
             try:
                 claude_response = await claude_integration.run_command(
@@ -809,10 +935,16 @@ class MessageOrchestrator:
                     user_id=user_id,
                     session_id=session_id,
                     on_stream=on_stream,
+                    force_new=force_new,
+                    chat_id=chat_id,
                 )
             finally:
                 heartbeat.cancel()
-            context.user_data["claude_session_id"] = claude_response.session_id
+
+            if force_new:
+                context.chat_data["force_new_session"] = False
+
+            context.chat_data["claude_session_id"] = claude_response.session_id
 
             from .utils.formatting import ResponseFormatter
 
@@ -821,17 +953,7 @@ class MessageOrchestrator:
                 claude_response.content
             )
 
-            await progress_msg.delete()
-
-            for i, message in enumerate(formatted_messages):
-                await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=None,
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
-                )
-                if i < len(formatted_messages) - 1:
-                    await asyncio.sleep(0.5)
+            await self._send_response(update, progress_msg, formatted_messages)
 
         except Exception as e:
             from .handlers.message import _format_error_message

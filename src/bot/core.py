@@ -56,6 +56,9 @@ class ClaudeCodeBot:
         builder.write_timeout(30)
         builder.pool_timeout(30)
 
+        # Allow concurrent update processing so different chats don't block each other
+        builder.concurrent_updates(True)
+
         self.app = builder.build()
 
         # Initialize feature registry
@@ -238,6 +241,9 @@ class ClaudeCodeBot:
             RateLimitExceeded,
             SecurityError,
         )
+
+        import traceback
+        logger.error("Full traceback", traceback="".join(traceback.format_exception(type(error), error, error.__traceback__)))
 
         error_messages = {
             AuthenticationError: "🔒 Authentication required. Please contact the administrator.",

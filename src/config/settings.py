@@ -74,24 +74,8 @@ class Settings(BaseSettings):
     )
     use_sdk: bool = Field(True, description="Use Python SDK instead of CLI subprocess")
     claude_allowed_tools: Optional[List[str]] = Field(
-        default=[
-            "Read",
-            "Write",
-            "Edit",
-            "Bash",
-            "Glob",
-            "Grep",
-            "LS",
-            "Task",
-            "MultiEdit",
-            "NotebookRead",
-            "NotebookEdit",
-            "WebFetch",
-            "TodoRead",
-            "TodoWrite",
-            "WebSearch",
-        ],
-        description="List of allowed Claude tools",
+        default=None,
+        description="List of allowed Claude tools (None = allow all)",
     )
     claude_disallowed_tools: Optional[List[str]] = Field(
         default=["git commit", "git push"],
@@ -141,7 +125,7 @@ class Settings(BaseSettings):
 
     # Output verbosity (0=quiet, 1=normal, 2=detailed)
     verbose_level: int = Field(
-        1,
+        2,
         description=(
             "Bot output verbosity: 0=quiet (final response only), "
             "1=normal (tool names + reasoning), "

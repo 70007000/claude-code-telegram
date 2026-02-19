@@ -30,7 +30,7 @@ class ResponseFormatter:
         """Initialize formatter with settings."""
         self.settings = settings
         self.max_message_length = 4000  # Telegram limit is 4096, leave some buffer
-        self.max_code_block_length = 3000  # Max length for code blocks
+        self.max_code_block_length = 15000  # Allow code blocks to split across messages
 
     def format_claude_response(
         self, text: str, context: Optional[dict] = None

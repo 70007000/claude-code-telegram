@@ -185,12 +185,12 @@ async def handle_text_message(
             return
 
         # Get current directory
-        current_dir = context.user_data.get(
+        current_dir = context.chat_data.get(
             "current_directory", settings.approved_directory
         )
 
         # Get existing session ID
-        session_id = context.user_data.get("claude_session_id")
+        session_id = context.chat_data.get("claude_session_id")
 
         # Enhanced stream updates handler with progress tracking
         async def stream_handler(update_obj):
@@ -212,7 +212,7 @@ async def handle_text_message(
             )
 
             # Update session ID
-            context.user_data["claude_session_id"] = claude_response.session_id
+            context.chat_data["claude_session_id"] = claude_response.session_id
 
             # Check if Claude changed the working directory and update our tracking
             _update_working_directory_from_claude_response(
@@ -301,7 +301,7 @@ async def handle_text_message(
                     )
 
         # Update session info
-        context.user_data["last_message"] = update.message.text
+        context.chat_data["last_message"] = update.message.text
 
         # Add conversation enhancements if available
         features = context.bot_data.get("features")
@@ -532,10 +532,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         # Get current directory and session
-        current_dir = context.user_data.get(
+        current_dir = context.chat_data.get(
             "current_directory", settings.approved_directory
         )
-        session_id = context.user_data.get("claude_session_id")
+        session_id = context.chat_data.get("claude_session_id")
 
         # Process with Claude
         try:
@@ -547,7 +547,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
 
             # Update session ID
-            context.user_data["claude_session_id"] = claude_response.session_id
+            context.chat_data["claude_session_id"] = claude_response.session_id
 
             # Check if Claude changed the working directory and update our tracking
             _update_working_directory_from_claude_response(
@@ -659,10 +659,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 return
 
             # Get current directory and session
-            current_dir = context.user_data.get(
+            current_dir = context.chat_data.get(
                 "current_directory", settings.approved_directory
             )
-            session_id = context.user_data.get("claude_session_id")
+            session_id = context.chat_data.get("claude_session_id")
 
             # Process with Claude
             try:
@@ -674,7 +674,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
 
                 # Update session ID
-                context.user_data["claude_session_id"] = claude_response.session_id
+                context.chat_data["claude_session_id"] = claude_response.session_id
 
                 # Format and send response
                 from ..utils.formatting import ResponseFormatter
@@ -781,7 +781,7 @@ async def _generate_placeholder_response(
     """Generate placeholder response until Claude integration is implemented."""
     settings: Settings = context.bot_data["settings"]
     current_dir = getattr(
-        context.user_data, "current_directory", settings.approved_directory
+        context.chat_data, "current_directory", settings.approved_directory
     )
     relative_path = current_dir.relative_to(settings.approved_directory)
 
@@ -863,7 +863,7 @@ def _update_working_directory_from_claude_response(
     ]
 
     content = claude_response.content.lower()
-    current_dir = context.user_data.get(
+    current_dir = context.chat_data.get(
         "current_directory", settings.approved_directory
     )
 
@@ -889,7 +889,7 @@ def _update_working_directory_from_claude_response(
                     new_path.is_relative_to(settings.approved_directory)
                     and new_path.exists()
                 ):
-                    context.user_data["current_directory"] = new_path
+                    context.chat_data["current_directory"] = new_path
                     logger.info(
                         "Updated working directory from Claude response",
                         old_dir=str(current_dir),

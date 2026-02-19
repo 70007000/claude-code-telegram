@@ -41,6 +41,7 @@ class ClaudeSession:
     message_count: int = 0
     tools_used: List[str] = field(default_factory=list)
     is_new_session: bool = False  # True if session hasn't been sent to Claude Code yet
+    chat_id: Optional[int] = None  # Telegram chat ID for per-chat isolation
 
     def is_expired(self, timeout_hours: int) -> bool:
         """Check if session has expired."""
@@ -63,7 +64,7 @@ class ClaudeSession:
 
     def to_dict(self) -> Dict:
         """Convert session to dictionary for storage."""
-        return {
+        d = {
             "session_id": self.session_id,
             "user_id": self.user_id,
             "project_path": str(self.project_path),
@@ -74,6 +75,9 @@ class ClaudeSession:
             "message_count": self.message_count,
             "tools_used": self.tools_used,
         }
+        if self.chat_id is not None:
+            d["chat_id"] = self.chat_id
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict) -> "ClaudeSession":
@@ -88,6 +92,7 @@ class ClaudeSession:
             total_turns=data.get("total_turns", 0),
             message_count=data.get("message_count", 0),
             tools_used=data.get("tools_used", []),
+            chat_id=data.get("chat_id"),
         )
 
 
@@ -165,6 +170,7 @@ class SessionManager:
         user_id: int,
         project_path: Path,
         session_id: Optional[str] = None,
+        chat_id: Optional[int] = None,
     ) -> ClaudeSession:
         """Get existing session or create new one."""
         logger.info(
@@ -172,6 +178,7 @@ class SessionManager:
             user_id=user_id,
             project_path=str(project_path),
             session_id=session_id,
+            chat_id=chat_id,
         )
 
         # Check for existing session
@@ -209,6 +216,7 @@ class SessionManager:
             project_path=project_path,
             created_at=datetime.utcnow(),
             last_used=datetime.utcnow(),
+            chat_id=chat_id,
         )
 
         # Mark as new session (not from Claude Code yet)

@@ -89,7 +89,7 @@ async def handle_cd_callback(
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
 
     try:
-        current_dir = context.user_data.get(
+        current_dir = context.chat_data.get(
             "current_directory", settings.approved_directory
         )
 
@@ -129,8 +129,8 @@ async def handle_cd_callback(
             return
 
         # Update directory and clear session
-        context.user_data["current_directory"] = new_path
-        context.user_data["claude_session_id"] = None
+        context.chat_data["current_directory"] = new_path
+        context.chat_data["claude_session_id"] = None
 
         # Send confirmation with new directory info
         relative_path = new_path.relative_to(settings.approved_directory)
@@ -331,10 +331,10 @@ async def _handle_new_session_action(query, context: ContextTypes.DEFAULT_TYPE) 
     settings: Settings = context.bot_data["settings"]
 
     # Clear session
-    context.user_data["claude_session_id"] = None
-    context.user_data["session_started"] = True
+    context.chat_data["claude_session_id"] = None
+    context.chat_data["session_started"] = True
 
-    current_dir = context.user_data.get(
+    current_dir = context.chat_data.get(
         "current_directory", settings.approved_directory
     )
     relative_path = current_dir.relative_to(settings.approved_directory)
@@ -371,7 +371,7 @@ async def _handle_end_session_action(query, context: ContextTypes.DEFAULT_TYPE) 
     settings: Settings = context.bot_data["settings"]
 
     # Check if there's an active session
-    claude_session_id = context.user_data.get("claude_session_id")
+    claude_session_id = context.chat_data.get("claude_session_id")
 
     if not claude_session_id:
         await query.edit_message_text(
@@ -396,15 +396,15 @@ async def _handle_end_session_action(query, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # Get current directory for display
-    current_dir = context.user_data.get(
+    current_dir = context.chat_data.get(
         "current_directory", settings.approved_directory
     )
     relative_path = current_dir.relative_to(settings.approved_directory)
 
     # Clear session data
-    context.user_data["claude_session_id"] = None
-    context.user_data["session_started"] = False
-    context.user_data["last_message"] = None
+    context.chat_data["claude_session_id"] = None
+    context.chat_data["session_started"] = False
+    context.chat_data["last_message"] = None
 
     # Create quick action buttons
     keyboard = [
@@ -443,7 +443,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
     settings: Settings = context.bot_data["settings"]
     claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
 
-    current_dir = context.user_data.get(
+    current_dir = context.chat_data.get(
         "current_directory", settings.approved_directory
     )
 
@@ -457,7 +457,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         # Check if there's an existing session in user context
-        claude_session_id = context.user_data.get("claude_session_id")
+        claude_session_id = context.chat_data.get("claude_session_id")
 
         if claude_session_id:
             # Continue with the existing session (no prompt = use --continue)
@@ -491,7 +491,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if claude_response:
             # Update session ID in context
-            context.user_data["claude_session_id"] = claude_response.session_id
+            context.chat_data["claude_session_id"] = claude_response.session_id
 
             # Send Claude's response
             await query.message.reply_text(
@@ -549,8 +549,8 @@ async def _handle_status_action(query, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = query.from_user.id
     settings: Settings = context.bot_data["settings"]
 
-    claude_session_id = context.user_data.get("claude_session_id")
-    current_dir = context.user_data.get(
+    claude_session_id = context.chat_data.get("claude_session_id")
+    current_dir = context.chat_data.get(
         "current_directory", settings.approved_directory
     )
     relative_path = current_dir.relative_to(settings.approved_directory)
@@ -627,7 +627,7 @@ async def _handle_status_action(query, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle ls action."""
     settings: Settings = context.bot_data["settings"]
-    current_dir = context.user_data.get(
+    current_dir = context.chat_data.get(
         "current_directory", settings.approved_directory
     )
 
@@ -804,7 +804,7 @@ async def handle_quick_action_callback(
         return
 
     settings: Settings = context.bot_data["settings"]
-    current_dir = context.user_data.get(
+    current_dir = context.chat_data.get(
         "current_directory", settings.approved_directory
     )
 
@@ -941,10 +941,10 @@ async def handle_conversation_callback(
             conversation_enhancer.clear_context(user_id)
 
         # Clear session data
-        context.user_data["claude_session_id"] = None
-        context.user_data["session_started"] = False
+        context.chat_data["claude_session_id"] = None
+        context.chat_data["session_started"] = False
 
-        current_dir = context.user_data.get(
+        current_dir = context.chat_data.get(
             "current_directory", settings.approved_directory
         )
         relative_path = current_dir.relative_to(settings.approved_directory)
@@ -1007,7 +1007,7 @@ async def handle_git_callback(
         )
         return
 
-    current_dir = context.user_data.get(
+    current_dir = context.chat_data.get(
         "current_directory", settings.approved_directory
     )
 
@@ -1150,7 +1150,7 @@ async def handle_export_callback(
         return
 
     # Get current session
-    claude_session_id = context.user_data.get("claude_session_id")
+    claude_session_id = context.chat_data.get("claude_session_id")
     if not claude_session_id:
         await query.edit_message_text(
             "❌ <b>No Active Session</b>\n\n" "There's no active session to export.",

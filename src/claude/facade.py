@@ -55,6 +55,8 @@ class ClaudeIntegration:
         user_id: int,
         session_id: Optional[str] = None,
         on_stream: Optional[Callable[[StreamUpdate], None]] = None,
+        force_new: bool = False,
+        chat_id: Optional[int] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
         logger.info(
@@ -63,13 +65,16 @@ class ClaudeIntegration:
             working_directory=str(working_directory),
             session_id=session_id,
             prompt_length=len(prompt),
+            force_new=force_new,
+            chat_id=chat_id,
         )
 
         # If no session_id provided, try to find an existing session for this
-        # user+directory combination (auto-resume)
-        if not session_id:
+        # user+directory+chat combination (auto-resume).
+        # Skip auto-resume when force_new is set (e.g. after /new command).
+        if not session_id and not force_new:
             existing_session = await self._find_resumable_session(
-                user_id, working_directory
+                user_id, working_directory, chat_id=chat_id
             )
             if existing_session:
                 session_id = existing_session.session_id
@@ -78,11 +83,12 @@ class ClaudeIntegration:
                     session_id=session_id,
                     project_path=str(working_directory),
                     user_id=user_id,
+                    chat_id=chat_id,
                 )
 
         # Get or create session
         session = await self.session_manager.get_or_create_session(
-            user_id, working_directory, session_id
+            user_id, working_directory, session_id, chat_id=chat_id
         )
 
         # Track streaming updates and validate tool calls
@@ -179,7 +185,7 @@ class ClaudeIntegration:
 
                     # Create a fresh session and retry
                     session = await self.session_manager.get_or_create_session(
-                        user_id, working_directory
+                        user_id, working_directory, chat_id=chat_id
                     )
                     response = await self._execute_with_fallback(
                         prompt=prompt,
@@ -350,11 +356,12 @@ class ClaudeIntegration:
         self,
         user_id: int,
         working_directory: Path,
+        chat_id: Optional[int] = None,
     ) -> Optional["ClaudeSession"]:
-        """Find the most recent resumable session for a user in a directory.
+        """Find the most recent resumable session for a user in a directory+chat.
 
-        Returns the session if one exists that is non-expired and has a real
-        (non-temporary) session ID from Claude. Returns None otherwise.
+        Sessions are scoped by (user_id, project_path, chat_id) so that
+        1-on-1 and group chats get independent Claude sessions.
         """
         from .session import ClaudeSession
 
@@ -366,6 +373,7 @@ class ClaudeIntegration:
             if s.project_path == working_directory
             and not s.session_id.startswith("temp_")
             and not s.is_expired(self.config.session_timeout_hours)
+            and s.chat_id == chat_id
         ]
 
         if not matching_sessions:
