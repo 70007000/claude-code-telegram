@@ -50,16 +50,17 @@ class TestingConfig:
 
 
 class ProductionConfig:
-    """Production environment configuration."""
+    """Production environment configuration.
+
+    NOTE: .env IS the production config. Only set non-controversial
+    defaults here — never override values the user explicitly sets
+    in .env (session_timeout, cost_per_user, rate_limit).
+    """
 
     debug: bool = False
     development_mode: bool = False
     log_level: str = "INFO"
-    enable_telemetry: bool = True
-    # Use stricter defaults for production
-    claude_max_cost_per_user: float = 5.0  # Lower cost limit
-    rate_limit_requests: int = 5  # Stricter rate limiting
-    session_timeout_hours: int = 12  # Shorter session timeout
+    enable_telemetry: bool = False
 
     @classmethod
     def as_dict(cls) -> Dict[str, Any]:

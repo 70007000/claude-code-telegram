@@ -78,8 +78,9 @@ class SQLiteSessionStorage(SessionStorage):
             # Try to update first
             cursor = await conn.execute(
                 """
-                UPDATE sessions 
-                SET last_used = ?, total_cost = ?, total_turns = ?, message_count = ?
+                UPDATE sessions
+                SET last_used = ?, total_cost = ?, total_turns = ?, message_count = ?,
+                    chat_id = COALESCE(?, chat_id)
                 WHERE session_id = ?
             """,
                 (
@@ -87,6 +88,7 @@ class SQLiteSessionStorage(SessionStorage):
                     session_model.total_cost,
                     session_model.total_turns,
                     session_model.message_count,
+                    session.chat_id,
                     session_model.session_id,
                 ),
             )
@@ -95,10 +97,10 @@ class SQLiteSessionStorage(SessionStorage):
             if cursor.rowcount == 0:
                 await conn.execute(
                     """
-                    INSERT INTO sessions 
-                    (session_id, user_id, project_path, created_at, last_used, 
-                     total_cost, total_turns, message_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO sessions
+                    (session_id, user_id, project_path, created_at, last_used,
+                     total_cost, total_turns, message_count, chat_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         session_model.session_id,
@@ -109,6 +111,7 @@ class SQLiteSessionStorage(SessionStorage):
                         session_model.total_cost,
                         session_model.total_turns,
                         session_model.message_count,
+                        session.chat_id,
                     ),
                 )
 
@@ -144,6 +147,7 @@ class SQLiteSessionStorage(SessionStorage):
                 total_turns=session_model.total_turns,
                 message_count=session_model.message_count,
                 tools_used=[],  # Tools are tracked separately in tool_usage table
+                chat_id=session_model.chat_id,
             )
 
             logger.debug(
@@ -191,6 +195,7 @@ class SQLiteSessionStorage(SessionStorage):
                     total_turns=session_model.total_turns,
                     message_count=session_model.message_count,
                     tools_used=[],  # Tools are tracked separately
+                    chat_id=session_model.chat_id,
                 )
                 sessions.append(claude_session)
 
@@ -217,6 +222,7 @@ class SQLiteSessionStorage(SessionStorage):
                     total_turns=session_model.total_turns,
                     message_count=session_model.message_count,
                     tools_used=[],  # Tools are tracked separately
+                    chat_id=session_model.chat_id,
                 )
                 sessions.append(claude_session)
 

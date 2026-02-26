@@ -12,74 +12,11 @@ logger = structlog.get_logger()
 async def security_middleware(
     handler: Callable, event: Any, data: Dict[str, Any]
 ) -> Any:
-    """Validate inputs and detect security threats.
+    """Security middleware — disabled for single-user setup.
 
-    This middleware:
-    1. Validates message content for dangerous patterns
-    2. Sanitizes file uploads
-    3. Detects potential attacks
-    4. Logs security violations
+    Input validation is unnecessary when the only user is the bot owner.
+    The auth middleware (whitelist) is the real gate.
     """
-    user_id = event.effective_user.id if event.effective_user else None
-    username = (
-        getattr(event.effective_user, "username", None)
-        if event.effective_user
-        else None
-    )
-
-    if not user_id:
-        logger.warning("No user information in update")
-        return await handler(event, data)
-
-    # Get dependencies from context
-    security_validator = data.get("security_validator")
-    audit_logger = data.get("audit_logger")
-
-    if not security_validator:
-        logger.error("Security validator not available in middleware context")
-        # Continue without validation (log error but don't block)
-        return await handler(event, data)
-
-    # Validate text content if present
-    message = event.effective_message
-    if message and message.text:
-        is_safe, violation_type = await validate_message_content(
-            message.text, security_validator, user_id, audit_logger
-        )
-        if not is_safe:
-            await message.reply_text(
-                f"🛡️ <b>Security Alert</b>\n\n"
-                f"Your message contains potentially dangerous content and has been blocked.\n"
-                f"Violation: {escape_html(violation_type)}\n\n"
-                "If you believe this is an error, please contact the administrator.",
-                parse_mode="HTML",
-            )
-            return  # Block processing
-
-    # Validate file uploads if present
-    if message and message.document:
-        is_safe, error_message = await validate_file_upload(
-            message.document, security_validator, user_id, audit_logger
-        )
-        if not is_safe:
-            await message.reply_text(
-                f"🛡️ <b>File Upload Blocked</b>\n\n"
-                f"{escape_html(error_message)}\n\n"
-                "Please ensure your file meets security requirements.",
-                parse_mode="HTML",
-            )
-            return  # Block processing
-
-    # Log successful security validation
-    logger.debug(
-        "Security validation passed",
-        user_id=user_id,
-        username=username,
-        has_text=bool(message and message.text),
-        has_document=bool(message and message.document),
-    )
-
-    # Continue to handler
     return await handler(event, data)
 
 

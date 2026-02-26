@@ -4,13 +4,13 @@ Provides simple interface for bot handlers.
 """
 
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 import structlog
 
 from ..config.settings import Settings
-from .exceptions import ClaudeToolValidationError
 from .integration import ClaudeProcessManager, ClaudeResponse, StreamUpdate
+from .interactive import InteractiveBridge
 from .monitor import ToolMonitor
 from .sdk_integration import ClaudeSDKManager
 from .session import SessionManager
@@ -46,6 +46,7 @@ class ClaudeIntegration:
 
         self.session_manager = session_manager
         self.tool_monitor = tool_monitor
+        self.bridge = InteractiveBridge()
         self._sdk_failed_count = 0  # Track SDK failures for adaptive fallback
 
     async def run_command(
@@ -57,6 +58,7 @@ class ClaudeIntegration:
         on_stream: Optional[Callable[[StreamUpdate], None]] = None,
         force_new: bool = False,
         chat_id: Optional[int] = None,
+        send_func: Optional[Callable] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
         logger.info(
@@ -91,59 +93,8 @@ class ClaudeIntegration:
             user_id, working_directory, session_id, chat_id=chat_id
         )
 
-        # Track streaming updates and validate tool calls
-        tools_validated = True
-        validation_errors = []
-        blocked_tools = set()
-
+        # Simple pass-through stream handler
         async def stream_handler(update: StreamUpdate):
-            nonlocal tools_validated
-
-            # Validate tool calls
-            if update.tool_calls:
-                for tool_call in update.tool_calls:
-                    tool_name = tool_call["name"]
-                    valid, error = await self.tool_monitor.validate_tool_call(
-                        tool_name,
-                        tool_call.get("input", {}),
-                        working_directory,
-                        user_id,
-                    )
-
-                    if not valid:
-                        tools_validated = False
-                        validation_errors.append(error)
-
-                        # Track blocked tools
-                        if "Tool not allowed:" in error:
-                            blocked_tools.add(tool_name)
-
-                        logger.error(
-                            "Tool validation failed",
-                            tool_name=tool_name,
-                            error=error,
-                            user_id=user_id,
-                        )
-
-                        # For critical tools, we should fail fast
-                        if tool_name in ["Task", "Read", "Write", "Edit"]:
-                            # Create comprehensive error message
-                            admin_instructions = self._get_admin_instructions(
-                                list(blocked_tools)
-                            )
-                            error_msg = self._create_tool_error_message(
-                                list(blocked_tools),
-                                self.config.claude_allowed_tools or [],
-                                admin_instructions,
-                            )
-
-                            raise ClaudeToolValidationError(
-                                error_msg,
-                                blocked_tools=list(blocked_tools),
-                                allowed_tools=self.config.claude_allowed_tools or [],
-                            )
-
-            # Pass to caller's handler
             if on_stream:
                 try:
                     await on_stream(update)
@@ -167,20 +118,47 @@ class ClaudeIntegration:
                     session_id=claude_session_id,
                     continue_session=should_continue,
                     stream_callback=stream_handler,
+                    chat_id=chat_id,
+                    send_func=send_func,
                 )
             except Exception as resume_error:
                 # If resume failed (e.g., session expired on Claude's side),
-                # retry as a fresh session
-                if (
-                    should_continue
-                    and "no conversation found" in str(resume_error).lower()
-                ):
+                # retry as a fresh session.  The SDK sometimes wraps the real
+                # error ("No conversation found") into a generic
+                # "Command failed with exit code 1" message, so we also
+                # treat any exit-code-1 failure during resume as stale.
+                #
+                # Also catch context overflow ("prompt is too long",
+                # "max.*token", "context.*length", etc.) — these mean the
+                # accumulated session history exceeded the model's limit.
+                error_lower = str(resume_error).lower()
+                is_stale_session = (
+                    "no conversation found" in error_lower
+                    or "exit code 1" in error_lower
+                )
+                is_context_overflow = (
+                    "prompt is too long" in error_lower
+                    or "too long" in error_lower
+                    or "max_tokens" in error_lower
+                    or "maximum context length" in error_lower
+                    or "context_length_exceeded" in error_lower
+                    or "request too large" in error_lower
+                    or "token limit" in error_lower
+                    or "content would exceed" in error_lower
+                )
+                should_retry_fresh = (
+                    (should_continue and is_stale_session)
+                    or is_context_overflow
+                )
+                if should_retry_fresh:
+                    reason = "context overflow" if is_context_overflow else "stale session"
                     logger.warning(
-                        "Session resume failed, starting fresh session",
+                        "Session failed, starting fresh session",
+                        reason=reason,
                         failed_session_id=claude_session_id,
                         error=str(resume_error),
                     )
-                    # Clean up the stale session
+                    # Clean up the broken session
                     await self.session_manager.remove_session(session.session_id)
 
                     # Create a fresh session and retry
@@ -193,47 +171,11 @@ class ClaudeIntegration:
                         session_id=None,
                         continue_session=False,
                         stream_callback=stream_handler,
+                        chat_id=chat_id,
+                        send_func=send_func,
                     )
                 else:
                     raise
-
-            # Check if tool validation failed
-            if not tools_validated:
-                logger.error(
-                    "Command completed but tool validation failed",
-                    validation_errors=validation_errors,
-                )
-                # Mark response as having errors and include validation details
-                response.is_error = True
-                response.error_type = "tool_validation_failed"
-
-                # Extract blocked tool names for user feedback
-                blocked_tools = []
-                for error in validation_errors:
-                    if "Tool not allowed:" in error:
-                        tool_name = error.split("Tool not allowed: ")[1]
-                        blocked_tools.append(tool_name)
-
-                # Create user-friendly error message
-                if blocked_tools:
-                    tool_list = ", ".join(f"`{tool}`" for tool in blocked_tools)
-                    response.content = (
-                        f"🚫 **Tool Access Blocked**\n\n"
-                        f"Claude tried to use tools not allowed:\n"
-                        f"{tool_list}\n\n"
-                        f"**What you can do:**\n"
-                        f"• Contact the administrator to request access to these tools\n"
-                        f"• Try rephrasing your request to use different approaches\n"
-                        f"• Check what tools are currently available with `/status`\n\n"
-                        f"**Currently allowed tools:**\n"
-                        f"{', '.join(f'`{t}`' for t in self.config.claude_allowed_tools or [])}"
-                    )
-                else:
-                    response.content = (
-                        f"🚫 **Tool Validation Failed**\n\n"
-                        f"Tools failed security validation. Try different approach.\n\n"
-                        f"Details: {'; '.join(validation_errors)}"
-                    )
 
             # Update session (this may change the session_id for new sessions)
             old_session_id = session.session_id
@@ -277,6 +219,8 @@ class ClaudeIntegration:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable] = None,
+        chat_id: Optional[int] = None,
+        send_func: Optional[Callable] = None,
     ) -> ClaudeResponse:
         """Execute command with SDK->subprocess fallback on JSON decode errors."""
         # Try SDK first if configured
@@ -289,6 +233,9 @@ class ClaudeIntegration:
                     session_id=session_id,
                     continue_session=continue_session,
                     stream_callback=stream_callback,
+                    chat_id=chat_id,
+                    send_func=send_func,
+                    bridge=self.bridge,
                 )
                 # Reset failure count on success
                 self._sdk_failed_count = 0

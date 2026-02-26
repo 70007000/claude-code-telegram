@@ -8,6 +8,7 @@ classic mode, delegates to existing full-featured handlers.
 import asyncio
 import re
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import structlog
@@ -28,6 +29,9 @@ from .message_queue import message_queue
 from .utils.html_format import escape_html
 
 logger = structlog.get_logger()
+
+UPLOAD_DIR = Path("/home/fer/klickie-social-agent/uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
 
 # Patterns that look like secrets/credentials in CLI arguments
 _SECRET_PATTERNS: List[re.Pattern[str]] = [
@@ -500,10 +504,35 @@ class MessageOrchestrator:
         updates). Typing indicators are handled by a separate heartbeat task.
         """
         last_edit_time = [0.0]  # mutable container for closure
+        opener_text = [None]  # Claude's first acknowledgment, persists in progress
         # Throttle: 4s for verbose modes, 10s for quiet mode
         throttle_interval = 10.0 if verbose_level == 0 else 4.0
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
+            # Capture Claude's first text as the opener (shown above progress)
+            if opener_text[0] is None and update_obj.content:
+                raw = update_obj.content
+                # content can be a string or a list of blocks
+                if isinstance(raw, list):
+                    parts = []
+                    for block in raw:
+                        if isinstance(block, str):
+                            parts.append(block)
+                        elif hasattr(block, "text"):
+                            parts.append(block.text)
+                        elif isinstance(block, dict) and "text" in block:
+                            parts.append(block["text"])
+                    text = "\n".join(parts).strip()
+                else:
+                    text = str(raw).strip()
+                if text:
+                    opener_text[0] = text[:500]
+                    try:
+                        await progress_msg.edit_text(opener_text[0])
+                        last_edit_time[0] = time.time()
+                    except Exception:
+                        pass
+
             # Capture tool calls (always, even in quiet mode — needed for final count)
             if update_obj.tool_calls:
                 for tc in update_obj.tool_calls:
@@ -515,9 +544,14 @@ class MessageOrchestrator:
             now = time.time()
             if (now - last_edit_time[0]) >= throttle_interval:
                 last_edit_time[0] = now
-                new_text = self._format_verbose_progress(
+                progress = self._format_verbose_progress(
                     tool_log, verbose_level, start_time
                 )
+                # Prepend opener so it stays visible above progress
+                if opener_text[0]:
+                    new_text = f"{opener_text[0]}\n\n{progress}"
+                else:
+                    new_text = progress
                 try:
                     await progress_msg.edit_text(new_text)
                 except Exception:
@@ -553,12 +587,12 @@ class MessageOrchestrator:
             message_length=len(message_text),
         )
 
-        # Rate limit check
-        rate_limiter = context.bot_data.get("rate_limiter")
-        if rate_limiter:
-            allowed, limit_message = await rate_limiter.check_rate_limit(user_id, 0.001)
-            if not allowed:
-                await update.message.reply_text(f"Rate limited: {limit_message}")
+        # Check if this message is a response to an interactive prompt
+        claude_integration = context.bot_data.get("claude_integration")
+        if claude_integration and hasattr(claude_integration, "bridge"):
+            bridge = claude_integration.bridge
+            if bridge.is_waiting(chat_id):
+                bridge.submit(chat_id, message_text)
                 return
 
         chat = update.message.chat
@@ -595,6 +629,9 @@ class MessageOrchestrator:
         # Wrap in a task so /stop can cancel it
         chat_id = update.effective_chat.id
 
+        async def _send_telegram(text: str):
+            await update.message.reply_text(text)
+
         async def _run_claude():
             return await claude_integration.run_command(
                 prompt=message_text,
@@ -604,6 +641,7 @@ class MessageOrchestrator:
                 on_stream=on_stream,
                 force_new=force_new,
                 chat_id=chat_id,
+                send_func=_send_telegram,
             )
 
         task = asyncio.create_task(_run_claude())
@@ -679,16 +717,6 @@ class MessageOrchestrator:
         # If multiple messages needed, delete progress and send new ones
         await self._send_response(update, progress_msg, formatted_messages)
 
-        # Audit log
-        audit_logger = context.bot_data.get("audit_logger")
-        if audit_logger:
-            await audit_logger.log_command(
-                user_id=user_id,
-                command="text_message",
-                args=[message_text[:100]],
-                success=success,
-            )
-
     async def _send_response(
         self,
         update: Update,
@@ -757,7 +785,7 @@ class MessageOrchestrator:
     async def agentic_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Process file upload -> Claude, minimal chrome."""
+        """Process file upload -> save to disk -> pass path to Claude."""
         user_id = update.effective_user.id
         document = update.message.document
 
@@ -767,59 +795,24 @@ class MessageOrchestrator:
             filename=document.file_name,
         )
 
-        # Security validation
-        security_validator = context.bot_data.get("security_validator")
-        if security_validator:
-            valid, error = security_validator.validate_filename(document.file_name)
-            if not valid:
-                await update.message.reply_text(f"File rejected: {error}")
-                return
-
-        # Size check
-        max_size = 10 * 1024 * 1024
-        if document.file_size > max_size:
-            await update.message.reply_text(
-                f"File too large ({document.file_size / 1024 / 1024:.1f}MB). Max: 10MB."
-            )
-            return
-
         chat = update.message.chat
         await chat.send_action("typing")
         progress_msg = await update.message.reply_text("Working...")
 
-        # Try enhanced file handler, fall back to basic
-        features = context.bot_data.get("features")
-        file_handler = features.get_file_handler() if features else None
-        prompt: Optional[str] = None
+        # Download and save to persistent uploads dir
+        ts = int(time.time())
+        safe_name = document.file_name or "document"
+        save_path = UPLOAD_DIR / f"{user_id}_{ts}_{safe_name}"
 
-        if file_handler:
-            try:
-                processed_file = await file_handler.handle_document_upload(
-                    document,
-                    user_id,
-                    update.message.caption or "Please review this file:",
-                )
-                prompt = processed_file.prompt
-            except Exception:
-                file_handler = None
+        try:
+            tg_file = await document.get_file()
+            await tg_file.download_to_drive(str(save_path))
+        except Exception as e:
+            await progress_msg.edit_text(f"Failed to download file: {e}")
+            return
 
-        if not file_handler:
-            file = await document.get_file()
-            file_bytes = await file.download_as_bytearray()
-            try:
-                content = file_bytes.decode("utf-8")
-                if len(content) > 50000:
-                    content = content[:50000] + "\n... (truncated)"
-                caption = update.message.caption or "Please review this file:"
-                prompt = (
-                    f"{caption}\n\n**File:** `{document.file_name}`\n\n"
-                    f"```\n{content}\n```"
-                )
-            except UnicodeDecodeError:
-                await progress_msg.edit_text(
-                    "Unsupported file format. Must be text-based (UTF-8)."
-                )
-                return
+        caption = update.message.caption or "User sent this file."
+        prompt = f"[File: {save_path}]\n\n{caption}"
 
         # Process with Claude
         claude_integration = context.bot_data.get("claude_integration")
@@ -887,15 +880,8 @@ class MessageOrchestrator:
     async def agentic_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Process photo -> Claude, minimal chrome."""
+        """Process photo -> save to disk -> pass path to Claude."""
         user_id = update.effective_user.id
-
-        features = context.bot_data.get("features")
-        image_handler = features.get_image_handler() if features else None
-
-        if not image_handler:
-            await update.message.reply_text("Photo processing is not available.")
-            return
 
         chat = update.message.chat
         await chat.send_action("typing")
@@ -903,9 +889,14 @@ class MessageOrchestrator:
 
         try:
             photo = update.message.photo[-1]
-            processed_image = await image_handler.process_image(
-                photo, update.message.caption
-            )
+            ts = int(time.time())
+            save_path = UPLOAD_DIR / f"{user_id}_{ts}_photo.jpg"
+
+            tg_file = await photo.get_file()
+            await tg_file.download_to_drive(str(save_path))
+
+            caption = update.message.caption or "User sent this photo."
+            prompt = f"[Photo: {save_path}]\n\n{caption}"
 
             claude_integration = context.bot_data.get("claude_integration")
             if not claude_integration:
@@ -930,7 +921,7 @@ class MessageOrchestrator:
             heartbeat = self._start_typing_heartbeat(chat)
             try:
                 claude_response = await claude_integration.run_command(
-                    prompt=processed_image.prompt,
+                    prompt=prompt,
                     working_directory=current_dir,
                     user_id=user_id,
                     session_id=session_id,

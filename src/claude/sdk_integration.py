@@ -17,20 +17,26 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 import structlog
 from claude_agent_sdk import (
     AssistantMessage,
+    CanUseTool,
     ClaudeAgentOptions,
     ClaudeSDKError,
     CLIConnectionError,
     CLIJSONDecodeError,
     CLINotFoundError,
     Message,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ProcessError,
     ResultMessage,
     TextBlock,
+    ToolPermissionContext,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
     query,
 )
+
+from .interactive import InteractiveBridge
 
 from ..config.settings import Settings
 from .exceptions import (
@@ -158,6 +164,9 @@ class ClaudeSDKManager:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        chat_id: Optional[int] = None,
+        send_func: Optional[Callable] = None,
+        bridge: Optional[InteractiveBridge] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -172,6 +181,11 @@ class ClaudeSDKManager:
         try:
             # Build Claude Agent options
             cli_path = find_claude_cli(self.config.claude_cli_path)
+
+            # Always bypass permissions. The can_use_tool callback pipe is
+            # fragile and causes "Stream closed" / "Tool permission request
+            # failed" errors that kill the entire session. Single-user bot
+            # doesn't need per-tool approval anyway.
             options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
                 cwd=str(working_directory),
@@ -202,10 +216,17 @@ class ClaudeSDKManager:
             cost = 0.0
             tools_used = []
 
+            # can_use_tool requires AsyncIterable prompt (streaming mode).
+            # Wrap the string prompt as a one-shot async generator.
+            if options.can_use_tool:
+                actual_prompt = self._wrap_prompt_as_stream(prompt, session_id)
+            else:
+                actual_prompt = prompt
+
             # Execute with streaming and timeout
             await asyncio.wait_for(
                 self._execute_query_with_streaming(
-                    prompt, options, messages, stream_callback
+                    actual_prompt, options, messages, stream_callback
                 ),
                 timeout=self.config.claude_timeout_seconds,
             )
@@ -338,7 +359,7 @@ class ClaudeSDKManager:
                 raise ClaudeProcessError(f"Unexpected error: {str(e)}")
 
     async def _execute_query_with_streaming(
-        self, prompt: str, options, messages: List, stream_callback: Optional[Callable]
+        self, prompt, options, messages: List, stream_callback: Optional[Callable]
     ) -> None:
         """Execute query with streaming and collect messages."""
         try:
@@ -482,6 +503,122 @@ class ClaudeSDKManager:
                 "Failed to load MCP config", path=str(config_path), error=str(e)
             )
             return {}
+
+    @staticmethod
+    async def _wrap_prompt_as_stream(prompt: str, session_id: Optional[str] = None):
+        """Wrap a string prompt as an AsyncIterable for streaming mode."""
+        yield {
+            "type": "user",
+            "session_id": session_id or "",
+            "message": {"role": "user", "content": prompt},
+            "parent_tool_use_id": None,
+        }
+
+    def _make_permission_callback(
+        self,
+        bridge: InteractiveBridge,
+        chat_id: int,
+        send_func: Callable,
+    ) -> CanUseTool:
+        """Create a can_use_tool callback that routes interactive tools through Telegram."""
+
+        async def _callback(
+            tool_name: str,
+            tool_input: Dict[str, Any],
+            context: ToolPermissionContext,
+        ):
+            # Interactive tools: present to user via Telegram
+            if tool_name == "ExitPlanMode":
+                return await self._handle_exit_plan_mode(
+                    tool_input, bridge, chat_id, send_func
+                )
+            if tool_name == "AskUserQuestion":
+                return await self._handle_ask_user_question(
+                    tool_input, bridge, chat_id, send_func
+                )
+
+            # Everything else: auto-approve
+            return PermissionResultAllow()
+
+        return _callback
+
+    async def _handle_exit_plan_mode(
+        self,
+        tool_input: Dict[str, Any],
+        bridge: InteractiveBridge,
+        chat_id: int,
+        send_func: Callable,
+    ):
+        """Handle ExitPlanMode: present plan approval options in Telegram."""
+        prompt_lines = ["Claude has a plan ready. What would you like to do?\n"]
+        prompt_lines.append("1. Approve and start implementation")
+        prompt_lines.append("2. Reject / revise the plan")
+        prompt_lines.append("\nReply with 1, 2, or type feedback:")
+
+        try:
+            response = await bridge.wait_for_user(
+                chat_id, "\n".join(prompt_lines), send_func
+            )
+            response = response.strip()
+            if response == "1" or response.lower() in ("yes", "approve", "go", "ok", "y"):
+                return PermissionResultAllow()
+            else:
+                return PermissionResultDeny(
+                    message=response if response != "2" else "User rejected the plan.",
+                )
+        except asyncio.TimeoutError:
+            return PermissionResultDeny(message="Timed out waiting for plan approval.")
+
+    async def _handle_ask_user_question(
+        self,
+        tool_input: Dict[str, Any],
+        bridge: InteractiveBridge,
+        chat_id: int,
+        send_func: Callable,
+    ):
+        """Handle AskUserQuestion: format question with options, wait for answer."""
+        questions = tool_input.get("questions", [])
+        if not questions:
+            return PermissionResultAllow()
+
+        prompt_lines = []
+        for q_idx, q in enumerate(questions):
+            question_text = q.get("question", "")
+            prompt_lines.append(f"**{question_text}**")
+            options = q.get("options", [])
+            for i, opt in enumerate(options):
+                label = opt.get("label", "")
+                desc = opt.get("description", "")
+                prompt_lines.append(f"  {i + 1}. {label}" + (f" - {desc}" if desc else ""))
+            prompt_lines.append("")
+
+        prompt_lines.append("Reply with a number or type your answer:")
+
+        try:
+            response = await bridge.wait_for_user(
+                chat_id, "\n".join(prompt_lines), send_func
+            )
+
+            # Map numbered response back to option label if possible
+            response = response.strip()
+            if questions and response.isdigit():
+                idx = int(response) - 1
+                options = questions[0].get("options", [])
+                if 0 <= idx < len(options):
+                    # Fill in the answer for the question
+                    label = options[idx].get("label", response)
+                    answers = {questions[0].get("question", ""): label}
+                    return PermissionResultAllow(
+                        updated_input={**tool_input, "answers": answers}
+                    )
+
+            # Free-text answer
+            answers = {questions[0].get("question", ""): response}
+            return PermissionResultAllow(
+                updated_input={**tool_input, "answers": answers}
+            )
+        except asyncio.TimeoutError:
+            return PermissionResultDeny(message="Timed out waiting for answer.")
 
     def _update_session(self, session_id: str, messages: List[Message]) -> None:
         """Update session data."""

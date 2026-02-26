@@ -96,57 +96,25 @@ class ClaudeCodeBot:
         self.orchestrator.register_handlers(self.app)
 
     def _add_middleware(self) -> None:
-        """Add middleware to application."""
-        from .middleware.auth import auth_middleware
-        from .middleware.rate_limit import rate_limit_middleware
-        from .middleware.security import security_middleware
+        """Add minimal auth middleware — single user ID check, nothing else."""
+        from telegram.ext import ApplicationHandlerStop
 
-        # Middleware runs in order of group numbers (lower = earlier)
-        # Security middleware first (validate inputs)
-        self.app.add_handler(
-            MessageHandler(
-                filters.ALL, self._create_middleware_handler(security_middleware)
-            ),
-            group=-3,
-        )
+        allowed_users = self.settings.allowed_users or []
 
-        # Authentication second
+        async def _auth_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            user = update.effective_user
+            if not user or user.id not in allowed_users:
+                if update.effective_message:
+                    await update.effective_message.reply_text(
+                        f"Not authorized. Your ID: {user.id if user else '?'}"
+                    )
+                raise ApplicationHandlerStop()
+
         self.app.add_handler(
-            MessageHandler(
-                filters.ALL, self._create_middleware_handler(auth_middleware)
-            ),
+            MessageHandler(filters.ALL, _auth_check),
             group=-2,
         )
-
-        # Rate limiting third
-        self.app.add_handler(
-            MessageHandler(
-                filters.ALL, self._create_middleware_handler(rate_limit_middleware)
-            ),
-            group=-1,
-        )
-
-        logger.info("Middleware added to bot")
-
-    def _create_middleware_handler(self, middleware_func: Callable) -> Callable:
-        """Create middleware handler that injects dependencies."""
-
-        async def middleware_wrapper(
-            update: Update, context: ContextTypes.DEFAULT_TYPE
-        ):
-            # Inject dependencies into context
-            for key, value in self.deps.items():
-                context.bot_data[key] = value
-            context.bot_data["settings"] = self.settings
-
-            # Create a dummy handler that does nothing (middleware will handle everything)
-            async def dummy_handler(event, data):
-                return None
-
-            # Call middleware with Telegram-style parameters
-            return await middleware_func(dummy_handler, update, context.bot_data)
-
-        return middleware_wrapper
+        logger.info("Auth check added", allowed_users=allowed_users)
 
     async def start(self) -> None:
         """Start the bot."""

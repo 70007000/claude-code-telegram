@@ -273,6 +273,18 @@ class DatabaseManager:
                 PRAGMA journal_mode=WAL;
                 """,
             ),
+            (
+                4,
+                """
+                -- Add chat_id to sessions for per-chat session isolation.
+                -- After PM2 restart in-memory chat_data is lost; this column
+                -- lets _find_resumable_session() match sessions to chats from
+                -- SQLite alone.
+                ALTER TABLE sessions ADD COLUMN chat_id INTEGER;
+                CREATE INDEX IF NOT EXISTS idx_sessions_chat_id
+                    ON sessions(user_id, project_path, chat_id);
+                """,
+            ),
         ]
 
     async def _init_pool(self):
